@@ -1,0 +1,445 @@
+/*
+ * emg_DPCM.c
+ * Created: 2025-11-27 오후 11:18:22
+ *
+ * emg_DPCM_checkSum.c -> 이걸로 캡스톤 제출!! -> EMG system final.c
+ * Created: 2025-12-02 오후 11:15:53
+ * [기반 코드] emg_DPCM.c (Gap Filling 포함)
+ * 1. 패킷 구조 변경:
+ * [Header(1)] + [Index(1)] + [Start(2)] + [Diffs(19)] + [FSR(2)] + [Checksum(1)]
+ * = 총 26 바이트
+ * 2. Header: 0xFA (기존 0xFE에서 변경하여 새 프로토콜 구분)
+ * 3. DPCM Clamping: 차이값이 -128~127을 벗어나면 강제로 제한 (Gap Filling 유지)
+ * 4. Checksum: Header를 제외한 모든 데이터의 합 (Sum & 0xFF)
+ *
+ * emg_DPCM_checksum_ISR.c
+ * Created: 2025-12-10 오후 10:42:58
+ * * [최종 수정 사항]
+ * ISR(ADC_vect) 내부말고 main loop으로 코드 이동
+ * Author : dykan
+ */ 
+
+
+#include <avr/io.h>
+#define F_CPU       16000000UL
+#include <util/delay.h>
+#include <avr/interrupt.h>
+#include <stdint.h>				// int16_t 변수를 선언하기 위해 필요
+
+#define NULL 0
+
+// --- 핀 설정 ---
+#define BT_STATE_PORT PORTE
+#define BT_STATE_PIN PE7
+
+// --- 버퍼 설정 ---
+#define TX_BUFFER_SIZE 256					// 1msec 주기의 실시간 데이터 손실 방지 및 안정적인 크기 선택
+#define TX_START_BYTE  0xFA					// [NEW] 헤더 (Start Byte)
+
+// --- 전역 변수 ---
+volatile uint8_t is_adc_running = 0;		// 1: ADC 실행 중, 0: 정지 상태
+volatile char rx_data = 0;					// 스마트폰으로부터 data 수신용 변수
+volatile uint16_t emg_buffer[20];			// 20개 원본 EMG 저장
+volatile uint8_t sample_count = 0;			// 0~19 카운트
+volatile uint16_t fsr_value_global = 0;		// 0~1023 FSR 값 저장
+volatile char buzzer_flag = 0;				// 1: buzzer 울림 중, 0: 대기 상태
+volatile uint8_t packet_ready = 0;			// packet 준비 완료
+
+// copies to be used by main safely (non-volatile copies are ok since main reads after flag)
+uint16_t emg_copy[20];
+uint16_t fsr_copy = 0;
+
+// overflow logging
+volatile uint32_t tx_overflow_count = 0;
+
+// 패킷 번호표 (0~255 계속 회전)
+volatile uint8_t tx_packet_counter = 0;
+
+// --- Ring Buffer ---
+volatile uint8_t tx_buffer[TX_BUFFER_SIZE];	// index 1당 uint8_t의 data를 저장함
+volatile uint8_t tx_head = 0;				// 쓰기 포인터 (ADC ISR)
+volatile uint8_t tx_tail = 0;				// 읽기 포인터 (TX ISR)
+
+// --- 함수 원형 ---
+uint16_t tx_buffer_free();
+void init_BT_State_Interrupt();
+void off_uart1_ADC();
+void init_Timer1_ADC();				// ADC Sampling 속도: 1kHz, 1000usec Timer1
+void init_Timer3_1sec_Delay();		// 'c' 문자 수신 시 1초 동안 buzzer 울리기
+void off_Timer1_ADC();				// Timer1 종료
+void off_Timer3_1sec_Delay();		// Timer3 종료
+void init_ADC_Common();				// ADC 입력 포트 선언, ADC 속도: 104usec로 설정
+void off_AD_conversion();			// ADC 종료
+void init_uart1_ADC();				// UART1 통신 초기화, 통신 속도: 174usec
+void tx_buffer_put(uint8_t data);
+void tx_start_transmission();
+
+int main(void)
+{
+
+	DDRF &= ( ~(1 << 6) & ~(1 << 7) );		// PF6(EMG), PF7(FSR): ADC 입력
+	
+	DDRA = 0x03;		// LED 2개 핀 초기화
+	DDRB = 0x10;		// buzzer 핀 초기화
+	
+	init_BT_State_Interrupt();	// 블루투스 상태 감지 인터럽트 초기화
+	sei();						// SREG |= 0x80;와 같음, 전역 Interrupt 활성화
+	
+	while (1)
+	{
+		if( rx_data != 0 )		// 스마트폰에서 문자 수신하면
+		{
+			char cmd = rx_data;
+			rx_data = 0;
+			
+			switch (cmd)
+			{
+				case 'a':               // 시작
+					sample_count = 0;
+					tx_head = 0;
+					tx_tail = 0;
+					tx_packet_counter = 0;	// 시작할 때 packet 번호표 초기화
+				
+					init_ADC_Common();		// ADC setting, ADC 속도: 104usec
+					init_Timer1_ADC();		// ADC Sampling 속도: 1kHz, 1000usec Timer
+					PORTA |= (1<<2);		// Green led on
+					break;
+				
+				case 'b':               // 종료
+					off_AD_conversion();
+					off_Timer1_ADC();
+					PORTA &= ~(1<<2);		// Green led off
+					PORTA &= ~(1<<1);		// Blue led off
+					break;
+				
+				case 'c':					// buzzer, led on
+					if (buzzer_flag == 0)	// buzzer 울림 중이 아닐 때만 실행됨
+					{
+						//PORTB |= (1<<4);		// 1sec 동안 buzzer on -> 전류 소모 감소를 위해 주석처리
+						//PORTA |= (1<<1);		// 1sec 동안 Blue led on -> 전류 소모 감소를 위해 주석처리
+						init_Timer3_1sec_Delay();	// 1초 카운트 시작
+						buzzer_flag = 1;			// 1초 동안 문자 'c' 수신 x
+					}
+					break;
+				
+				default : break;
+			}
+		}
+		
+		if (packet_ready)		// 스마트폰으로부터 문자 수신 안할 때 실행됨
+		{
+			//   main   : packet_ready == 1
+			//	 ISR    : packet_ready = 1 (새로운 이벤트 발생)
+			//	 main   : packet_ready = 0  <-- 이게 두 이벤트를 모두 지워버림!!
+			cli();						// 위의 상황을 방지하기 위해 모든 interrupt 대기시킴
+			packet_ready = 0;
+			sei();						// 전역 interrupt 다시 활성화
+			
+			// --- 패킷 생성 (총 26 Bytes) ---
+			// 구조: [Header(1)] [Index(1)] [Start(2)] [Diffs(19)] [FSR(2)] [Checksum(1)]
+			
+			uint8_t checksum = 0; // checkSum 계산용 변수
+
+			const uint16_t PACKET_SIZE = 26;
+						
+			if (tx_buffer_free() >= PACKET_SIZE)
+			{
+				// ★★★ 핵심 로직 (DPCM + Indexing) ★★★
+				
+				// 1. Header (0xFA) - 체크섬 제외
+				tx_buffer_put(TX_START_BYTE);		// 데이터를 버퍼에 저장 (배열 index인 tx_head를 조정), TX_START_BYTE: [NEW] 헤더 (Start Byte)
+
+				// 2. Index (패킷 번호표)
+				tx_buffer_put(tx_packet_counter);	// 데이터를 버퍼에 저장 (배열 index인 tx_head를 조정)
+				checksum += tx_packet_counter;		// checkSum 더하기
+				tx_packet_counter++;				// 보내고 나서 1 증가 (0->1->...->255->0), 패킷 번호표 (0~255 순환 회전)
+				
+				// 3. EMG Start Value (2 Bytes)
+				uint8_t start_h = (uint8_t)(emg_copy[0] >> 8);
+				uint8_t start_l = (uint8_t)(emg_copy[0] & 0xff);
+				
+				tx_buffer_put(start_h);				// 데이터를 버퍼에 저장 (배열 index인 tx_head를 조정)
+				checksum += start_h;				// checkSum 더하기
+				
+				tx_buffer_put(start_l);				// 데이터를 버퍼에 저장 (배열 index인 tx_head를 조정)
+				checksum += start_l;				// checkSum 더하기
+				
+				// 4. EMG Diffs (19 Bytes) - Gap Filling(Clamping) 적용
+				for (int i = 1; i < 20; i++)
+				{
+					int diff = emg_copy[i] - emg_copy[i-1];		// uint16_t emg_copy[20]; -> 20개 copy본 EMG 저장
+					
+					// Clamping Logic (-128 ~ 127)
+					if (diff > 127) diff = 127;
+					if (diff < -128) diff = -128;
+					
+					uint8_t diff_byte = (uint8_t)((int8_t)diff);
+					
+					tx_buffer_put(diff_byte);		// 데이터를 버퍼에 저장 (배열 index인 tx_head를 조정)
+					checksum += diff_byte;			// 체크섬 더하기
+				}
+				
+				// 5. FSR Value (2 Bytes)
+				uint8_t fsr_h = (uint8_t)(fsr_copy >> 8);
+				uint8_t fsr_l = (uint8_t)(fsr_copy & 0xff);
+
+				tx_buffer_put(fsr_h);		// 데이터를 버퍼에 저장 (배열 index인 tx_head를 조정)
+				checksum += fsr_h;
+				
+				tx_buffer_put(fsr_l);		// 데이터를 버퍼에 저장 (배열 index인 tx_head를 조정)
+				checksum += fsr_l;
+
+				// 6. Checksum (1 Byte)
+				tx_buffer_put(checksum);	// 데이터를 버퍼에 저장 (배열 index인 tx_head를 조정)
+
+				// 전송 시작
+				tx_start_transmission();
+			}
+			
+			else	// overflow debugging
+			{
+				tx_overflow_count++;
+				
+				if (tx_overflow_count >= 10)
+				{
+					// Optionally toggle a LED or set a flag to observe this
+					PORTA |= (1<<1);		// 1sec 동안 Blue led on
+				}
+
+			}
+		}
+	}
+}
+
+uint16_t tx_buffer_free()
+{
+	if (tx_head >= tx_tail)
+		return (TX_BUFFER_SIZE - (tx_head - tx_tail) - 1);
+	
+	else
+		return (tx_tail - tx_head - 1);
+}
+
+// --- Bluetooth 상태 감지 ---
+void init_BT_State_Interrupt()		// 외부 인터럽트 PE7(INT7) 설정
+{
+	DDRE &= ~(1 << BT_STATE_PIN);		// 1. PE7(INT7) 핀을 입력으로 설정
+	
+	// 2. 외부 인터럽트 7 (INT7) 설정 (EICRB 레지스터)
+	// EICRB: INT7 제어 레지스터 (ISC71, ISC70)
+	// ISC71=0, ISC70=1: 신호가 High->Low 또는 Low->High 모두에서 인터럽트 발생
+	EICRB &= ~(1 << ISC71);
+	EICRB |= (1 << ISC70);
+	
+	// 3. EIMSK: 외부 인터럽트 마스크 레지스터
+	EIMSK |= (1 << INT7); // INT7 인터럽트 활성화
+}
+
+ISR(INT7_vect)		// 블루투스 STATE 핀의 변화를 감지하여 ADC/Timer1의 시작 또는 종료를 제어
+{
+	// ISR 실행 시 자동 cli() 선언
+	
+	if ( !(PINE & (1 << BT_STATE_PIN)) )    // BLE STATE 핀이 LOW: BT 연결 OFF -> 모든 MCU 기능 종료
+	{
+		off_uart1_ADC();			// TX 중이던 BLE 통신 종료
+		tx_head = 0;
+		tx_tail = 0;
+		
+		off_AD_conversion();		// AD conversion 중지
+		off_Timer1_ADC();			// ADC sampling용 Timer1 중지
+		off_Timer3_1sec_Delay();	// 1초 계산 Timer3 종료
+		PORTA &= ~(1<<2);			// Green led off
+		PORTB &= ~(1<<4);			// buzzer off
+		PORTA &= ~(1<<1);			// Blue led off
+	}
+	
+	else    // BLE STATE 핀이 High: BT 연결 ON -> MCU 기능 재설정
+	{
+		rx_data = 0;			// 스마트폰으로부터 data 수신용 변수
+		tx_head = 0;
+		tx_tail = 0;
+		init_uart1_ADC();		// UART1 통신 초기화, 통신 속도: 174usec
+	}
+	
+	// ISR 종료 시 자동 sei() 선언
+}
+
+// --- UART ---
+void init_uart1_ADC()	// UART1 통신 초기화, 통신 속도: 174usec
+{
+	UCSR1B = (1<<RXEN1) | (1<<TXEN1) | (1<<RXCIE1);		// TX, RX, RX Interrupt Enable
+	UCSR1C = 0x06;		// UART mode, 8 bit data, no parity, 1 stop bit
+	UBRR1H = 0;
+	UBRR1L = 8;			// Baud Rate 115200으로 설정, 통신 속도: 20bits/115.2kbps = 174usec
+}
+
+// RX ISR: store command char (non-blocking)
+ISR(USART1_RX_vect)
+{
+	uint8_t d = UDR1;
+	rx_data = d;		// main will process
+}
+
+void off_uart1_ADC()
+{
+	UCSR1B &= ~( (1<<TXEN1) | (1<<RXEN1) | (1<<UDRIE1) | (1<<RXCIE1) );	// TX/RX Disable
+	
+	volatile uint8_t dummy = UDR1;	// RXC1 flag clear (dummy read) (RXC1 남아서 check_rx() 오작동 방지)
+	
+	UBRR1H = 0;
+	UBRR1L = 0;		// CLK 정지 효과 -> 전력 절감
+}
+
+void tx_buffer_put(uint8_t data)		// 데이터를 버퍼에 저장 (배열 index인 tx_head를 조정)
+{
+	// 버퍼가 가득 찼는지 확인 (Head가 Tail의 바로 앞이면 가득 찬 것)
+	uint8_t next_head = (tx_head + 1) % TX_BUFFER_SIZE;		// (N+1) 계산
+	
+	if (next_head != tx_tail)
+	{
+		tx_buffer[tx_head] = data;	// uint8_t data가 현재 index tx_head (N)에 저장됨
+		tx_head = next_head;		// 배열 index인 tx_head가 N+1로 이동
+	}
+}
+
+void tx_start_transmission()		// 송신 시작을 알리는 trigger 역할의 함수
+{
+	if (tx_head != tx_tail)			// 버퍼에 데이터가 있고 (Head != Tail), TX 인터럽트가 비활성화된 상태이면
+		UCSR1B |= (1 << UDRIE1);	// UDRIE1 비트 설정: UDR1이 비었을 때(이전 data를 전부 송신 완료 시) 인터럽트 발생을 허용
+		// UDRIE1이 현재 비활성화 상태인지 추가로 체크할 필요는 없음
+		// 그냥 활성화 시켜주면 됨
+		// UDRIE1이 활성화되는 순간, UDR1 register가 비었다면 ISR(USART1_UDRE_vect)가 즉시 실행됨
+		// EMG High(N) -> EMG Low(N+1) -> FSR High(N+2) -> FSR Low(N+3) 순으로 송신
+	
+}
+
+ISR(USART1_UDRE_vect)			// UDR1이 비었을 때(이전 data를 전부 송신 완료 시) 실행됨
+{
+	// ISR 실행 시 자동 cli() 선언
+	
+	if (tx_head != tx_tail)		// 버퍼에 데이터가 남아있는지 확인
+	{
+		UDR1 = tx_buffer[tx_tail];					// 버퍼의 Tail 포인터에 있는 데이터를 TXD로 즉시 송신
+		tx_tail = (tx_tail + 1) % TX_BUFFER_SIZE;	// Tail 포인터를 다음 데이터 위치로 한 칸 이동
+		// 버퍼에서 배열 끝에 도달 시 다시 처음으로 돌아감
+	}
+	
+	else	// 버퍼가 비어 (tx_head == tx_tail) 더 이상 보낼 데이터가 없을 때 실행됨
+		UCSR1B &= ~(1 << UDRIE1);		// 보낼 데이터가 없으면 TX 인터럽트를 비활성화 -> 현재 ISR 종료
+	
+	// ISR 종료 시 자동 sei() 선언
+}
+
+// --- Timer & ADC ---
+void init_Timer1_ADC()			// ADC Sampling 속도: 1kHz, 1000usec Timer1
+{
+	cli();						// 함수 실행 동안 다른 interrupt 발생 시 대기시킴
+	TIMSK |= (1 << TOIE1);		// TOIE=1, Timer Overflow Interrupt enable
+	TCCR1A = 0x00;				// Normal mode (1,0)번째 bit (0,0)
+	TCCR1B = 0x03;              // Normal mode (4,3)번째 bit (0,0), Prescaler : 64 (2,1,0)번째 bit -> (0,1,1)
+	TCNT1 = 65287;              // 1ms, // 카운트값  = 65536 - 65287 + 1 = 250
+	sei();						// SREG |= 0x80;와 같음, 전역 interrupt 활성화
+}
+
+void off_Timer1_ADC()
+{
+	TIMSK &= ~(1 << TOIE1);		// TOIE=0, Timer Overflow Interrupt disable
+	TCCR1B = 0x00;				// CLK 소스를 멈춰서 Timer1를 완전히 정지
+}
+
+// Interrupt 발생 주기 = 1/(16*1000000) * 64 * (65536-65287+1) = 0.001sec = 1000usec
+ISR(TIMER1_OVF_vect)
+{
+	// ISR 실행 시 자동 cli() 선언
+	
+	TCNT1 = 65287;				// 카운트값  = 65536 - 65287 + 1 = 250
+	
+	// EMG ADC 초기화 (PF6)
+	ADMUX = 0x46;				// REFS(1:0) = 01 : AVCC(+5V) 기준 전압 사용
+	// MUX 00110 ADC6(PF6) Single Ended Input 선택
+	ADCSRA |= 0x40;				// (비트6) ADSC = 1 변환 시작
+	
+	// ISR 종료 시 자동 sei() 선언
+}
+
+void init_ADC_Common()
+{
+	// ADEN = 1, ADFR = 0, 16MHz, Prescaler: 128(ADPS2, ADPS1, ADPS0 = 1,1,1) -> 16MHz/128 = 125kHz
+	ADCSRA = (1<<ADEN) | (1<<ADIE) | (1<<ADPS2) | (1<<ADPS1) | (1<<ADPS0);
+}
+
+void off_AD_conversion()
+{
+	ADCSRA &= ~(1 << ADIE);		// ADC interrupt Disable
+	ADCSRA |= (1 << ADIF);		// ADC interrupt flag clear
+	ADCSRA &= ~(1 << ADEN);		// ADC 완전 비활성화
+}
+
+ISR(ADC_vect)		// AD Conversion이 완료되면 자동으로 실행됨
+{
+	// ISR 실행 시 자동 cli() 선언
+	
+	static char current_channel = 6;		// 선언 (최초 1회만 6으로 초기화됨)
+	
+	int val = (int)ADCL + ((int)ADCH << 8);		// AD conversion 값 읽기, 0~1023으로 변환
+
+	if (current_channel == 6)	// EMG ADC 완료
+	{
+		// EMG data 20개 모으기
+		emg_buffer[sample_count++] = val;		// volatile uint16_t emg_buffer[20]; -> 20개 원본 EMG 저장
+		
+		if (sample_count >= 20)		// 20개 EMG sample 수집 시
+		{
+			current_channel = 7;	// FSR로 이동
+			ADMUX = 0x47;			// REFS(1:0) = 01 : AVCC(+5V) 기준 전압 사용
+			// MUX 00111 ADC7(PF7) Single Ended Input 선택
+			ADCSRA |= 0x40;			// (비트6) ADSC = 1 변환 시작
+		}	
+	}
+	
+	else // FSR ADC 완료 -> 전송 패킷 생성
+	{
+		fsr_value_global = val;						// 0~1023 FSR 값 저장
+		
+		for (int i = 0; i < 20; i++)
+			emg_copy[i] = emg_buffer[i];			// main에서 로직 계산 중 emg 데이터가 새로 덮어 쓰여지는 것을 방지하기 위함
+		
+		fsr_copy = fsr_value_global;				// main에서 로직 계산 중 fsr 데이터가 새로 덮어 쓰여지는 것을 방지하기 위함
+		
+		current_channel = 6;		// 다음엔 EMG 신호를 adc 하기 위함
+		sample_count = 0;
+		
+		packet_ready = 1;			// packet 저장 완료 -> main에서 DPCM, Checksum 로직 계산 후 통신 시작
+	}
+}
+
+// --- Timer3 ---
+void init_Timer3_1sec_Delay()	// Buzzer, LED 1회 작동용 Timer3 (1초 주기)
+{
+	cli();						// 함수 실행 동안 다른 interrupt 발생 시 대기시킴
+	ETIMSK |= (1 << TOIE3);		// Timer3 Overflow Interrupt Enable
+	TCCR3A = 0x00;				// Normal mode
+	TCCR3B = (1 << CS32);       // Prescaler: 256 (CS32,31,30 = 100)
+	TCNT3 = 3036;				// 카운트값  = 65536 - 62500 = 3036
+	sei();						// SREG |= 0x80;와 같음, 전역 interrupt 활성화
+}
+
+// Interrupt 발생 = 1/(16*1000000) * 256 * 62500 = 1sec, 단 1회만 실행됨
+ISR(TIMER3_OVF_vect)			// 1sec Timer3
+{
+	// ISR 실행 시 자동 cli() 선언
+	
+	PORTB &= ~(1<<4);		// 1초 후 buzzer off
+	PORTA &= ~(1<<1);		// 1초 후 Blue led off
+	
+	off_Timer3_1sec_Delay();	// Timer3 종료 -> 단 1회만 실행됨
+	buzzer_flag = 0;			// 다음 'c' 문자 수신 수락
+	
+	// ISR 종료 시 자동 sei() 선언
+}
+
+void off_Timer3_1sec_Delay()	// Timer3를 종료하기 위한 함수
+{
+	ETIMSK &= ~(1 << TOIE3);	// TOIE3=0, Timer Overflow Interrupt disable
+	TCCR3B = 0x00;				// CLK 소스를 멈춰서 Timer3를 완전히 정지
+}
