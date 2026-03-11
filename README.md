@@ -23,7 +23,7 @@ The firmware performs the following functions:
 2. FSR Sensor Measurement
   - Pressure sensor value acquired after EMG sampling
 
-3.Signal Compression
+3. Signal Compression
   - EMG samples compressed using DPCM
   - Reduces wireless transmission bandwidth
 
