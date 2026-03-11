@@ -12,20 +12,24 @@ This system was developed as part of a Capstone Design project for a wearable re
 
 The firmware performs the following functions:
 
-1. EMG Signal Acquisition
-   - ADC sampling at 1 kHz
-   - 20 EMG samples collected per packet
+## System Overview
 
-2. FSR Sensor Measurement
-   - Pressure sensor value acquired after EMG sampling
+The firmware performs the following functions:
 
-3. Signal Compression
-   - EMG samples compressed using DPCM
-   - Reduces wireless transmission bandwidth
+- **EMG Signal Acquisition**
+  - ADC sampling at 1 kHz
+  - 20 EMG samples collected per packet
 
-4. Wireless Transmission
-   - UART communication with BLE module
-   - Packet-based data streaming
+- **FSR Sensor Measurement**
+  - Pressure sensor value acquired after EMG sampling
+
+- **Signal Compression**
+  - EMG samples compressed using DPCM
+  - Reduces wireless transmission bandwidth
+
+- **Wireless Transmission**
+  - UART communication with BLE module
+  - Packet-based data streaming
 
 ---
 
