@@ -16,20 +16,20 @@ The firmware performs the following functions:
 
 The firmware performs the following functions:
 
-- **EMG Signal Acquisition**
-  - ADC sampling at 1 kHz
-  - 20 EMG samples collected per packet
+EMG Signal Acquisition
+ - ADC sampling at 1 kHz
+ - 20 EMG samples collected per packet
 
-- **FSR Sensor Measurement**
-  - Pressure sensor value acquired after EMG sampling
+FSR Sensor Measurement
+ - Pressure sensor value acquired after EMG sampling
 
-- **Signal Compression**
-  - EMG samples compressed using DPCM
-  - Reduces wireless transmission bandwidth
+Signal Compression
+ - EMG samples compressed using DPCM
+ - Reduces wireless transmission bandwidth
 
-- **Wireless Transmission**
-  - UART communication with BLE module
-  - Packet-based data streaming
+Wireless Transmission
+ - UART communication with BLE module
+ - Packet-based data streaming
 
 ---
 
