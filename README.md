@@ -12,10 +12,6 @@ This system was developed as part of a Capstone Design project for a wearable re
 
 The firmware performs the following functions:
 
-## System Overview
-
-The firmware performs the following functions:
-
 1. EMG Signal Acquisition
   - ADC sampling at 1 kHz
   - 20 EMG samples collected per packet
